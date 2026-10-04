@@ -1,11 +1,18 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "os"
-
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -21,8 +28,7 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-var coordSockName string // socket for coordinator
-
+var coordSockName string
 
 // main/mrworker.go calls this function.
 func Worker(sockname string, mapf func(string, string) []KeyValue,
@@ -32,36 +38,187 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 
 	// Your worker implementation here.
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+	for {
+		reply := TaskReply{}
+		if !CallTask(&TaskArgs{}, &reply) {
+			os.Exit(0)
+		}
+		switch reply.TaskType {
+		case ExitTask:
+			return
+		case WaitTask:
+			// The coordinator blocks until work exists, so this is only a fallback.
+			time.Sleep(time.Second)
+			continue
+		}
+		if err := processTask(reply, mapf, reducef); err != nil {
+			log.Printf("%v task %d failed: %v", reply.TaskType, reply.TaskID, err)
+			continue
+		}
+		ok := CallReplTask(reply.TaskID, reply.TaskType)
+		fmt.Println("Report task completion status:", ok)
+	}
 
 }
 
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
+func processTask(t TaskReply, mapf func(string, string) []KeyValue, reducef func(string, []string) string) error {
+	switch t.TaskType {
+	case MapTask:
+		return processMapTask(t, mapf)
+	case ReduceTask:
+		return processReduceTask(t, reducef)
+	default:
+		return fmt.Errorf("unexpected task type %v", t.TaskType)
+	}
+}
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+func processMapTask(t TaskReply, mapf func(string, string) []KeyValue) error {
+	content, err := os.ReadFile(t.FileName)
+	if err != nil {
+		return fmt.Errorf("read input: %w", err)
+	}
+
+	kva := mapf(t.FileName, string(content))
+
+	tempFiles := make([]*os.File, t.NReduce)
+	writers := make([]*bufio.Writer, t.NReduce)
+	encoders := make([]*json.Encoder, t.NReduce)
+	defer func() {
+		// close anything left open by an early return
+		for _, f := range tempFiles {
+			if f != nil {
+				f.Close()
+			}
+		}
+	}()
+
+	for i := 0; i < t.NReduce; i++ {
+		tempFile, err := os.CreateTemp(".", fmt.Sprintf("mr-map-temp-%d-*", t.TaskID))
+		if err != nil {
+			return fmt.Errorf("create temp file: %w", err)
+		}
+		tempFiles[i] = tempFile
+		// buffer so each Encode isn't its own write syscall
+		writers[i] = bufio.NewWriter(tempFile)
+		encoders[i] = json.NewEncoder(writers[i])
+	}
+
+	for _, kv := range kva {
+		bucket := ihash(kv.Key) % t.NReduce
+		if err := encoders[bucket].Encode(&kv); err != nil {
+			return fmt.Errorf("encode kv: %w", err)
+		}
+	}
+
+	for i := 0; i < t.NReduce; i++ {
+		if err := writers[i].Flush(); err != nil {
+			return fmt.Errorf("flush %s: %w", tempFiles[i].Name(), err)
+		}
+		if err := tempFiles[i].Close(); err != nil {
+			return fmt.Errorf("close %s: %w", tempFiles[i].Name(), err)
+		}
+
+		finalName := fmt.Sprintf("mr-%d-%d", t.TaskID, i)
+		if err := os.Rename(tempFiles[i].Name(), finalName); err != nil {
+			return fmt.Errorf("rename temp file to %v: %w", finalName, err)
+		}
+	}
+	return nil
+}
+
+// readIntermediate decodes every KeyValue in one map output file.
+func readIntermediate(name string) ([]KeyValue, error) {
+	file, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var kva []KeyValue
+	dec := json.NewDecoder(file)
+	for {
+		var kv KeyValue
+		if err := dec.Decode(&kv); err != nil {
+			if errors.Is(err, io.EOF) {
+				return kva, nil
+			}
+			return nil, fmt.Errorf("decode %s: %w", name, err)
+		}
+		kva = append(kva, kv)
+	}
+}
+
+func processReduceTask(t TaskReply, reducef func(string, []string) string) error {
+	var kva []KeyValue
+	for m := 0; m < t.NMap; m++ {
+		pairs, err := readIntermediate(fmt.Sprintf("mr-%d-%d", m, t.TaskID))
+		if err != nil {
+			return err
+		}
+		kva = append(kva, pairs...)
+	}
+
+	sort.Slice(kva, func(i, j int) bool {
+		return kva[i].Key < kva[j].Key
+	})
+
+	tempFile, err := os.CreateTemp(".", fmt.Sprintf("mr-out-temp-%d-*", t.TaskID))
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	defer tempFile.Close()
+	out := bufio.NewWriter(tempFile)
+
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+
+		var values []string
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+
+		output := reducef(kva[i].Key, values)
+
+		if _, err := fmt.Fprintf(out, "%v %v\n", kva[i].Key, output); err != nil {
+			return fmt.Errorf("write output: %w", err)
+		}
+
+		i = j
+	}
+
+	if err := out.Flush(); err != nil {
+		return fmt.Errorf("flush %s: %w", tempFile.Name(), err)
+	}
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tempFile.Name(), err)
+	}
+
+	finalName := fmt.Sprintf("mr-out-%d", t.TaskID)
+	if err := os.Rename(tempFile.Name(), finalName); err != nil {
+		return fmt.Errorf("rename temp file to %v: %w", finalName, err)
+	}
+	return nil
+}
+
+func CallTask(args *TaskArgs, reply *TaskReply) bool {
+	return call("Coordinator.Task", args, reply)
+}
+
+func CallReplTask(taskID int, taskType TaskType) bool {
+	args := ReportTaskArgs{}
 
 	// fill in the argument(s).
-	args.X = 99
-
+	args.TaskID = taskID
+	args.TaskType = taskType
 	// declare a reply structure.
-	reply := ExampleReply{}
+	reply := ReportTaskReply{}
+	ok := call("Coordinator.TaskReply", &args, &reply)
 
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
-	}
+	return ok
 }
 
 // send an RPC request to the coordinator, wait for the response.
