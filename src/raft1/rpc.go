@@ -49,6 +49,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.isLeader = false
+		rf.persist()
 	}
 
 	lastLogIndex := len(rf.log) - 1
@@ -59,6 +60,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && upToDate {
 		rf.votedFor = args.CandidateId
 		rf.lastHeard = time.Now()
+		rf.persist()
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
 		return
@@ -81,6 +83,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 	}
 
 	rf.isLeader = false
@@ -122,6 +125,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	rf.log = append(rf.log, args.Entries[i:]...)
+	if i < len(args.Entries) {
+		rf.persist()
+	}
 
 	if args.LeaderCommit > rf.commitIndex {
 		lastNewIndex := args.PrevLogIndex + len(args.Entries)

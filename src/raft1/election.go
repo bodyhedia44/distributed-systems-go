@@ -12,6 +12,7 @@ func (rf *Raft) startElection() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.lastHeard = time.Now()
+	rf.persist()
 	term := rf.currentTerm
 	votes := 1
 
@@ -43,6 +44,7 @@ func (rf *Raft) startElection() {
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
 				rf.votedFor = -1
+				rf.persist()
 				return
 			}
 

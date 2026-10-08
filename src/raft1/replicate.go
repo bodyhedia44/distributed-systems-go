@@ -58,6 +58,7 @@ func (rf *Raft) replicateOne(server int) {
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
 		rf.isLeader = false
+		rf.persist()
 		return
 	}
 
