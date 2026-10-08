@@ -16,11 +16,8 @@ func (rf *Raft) startElection() {
 	term := rf.currentTerm
 	votes := 1
 
-	lastLogIndex := len(rf.log) - 1
-	lastLogTerm := 0
-	if lastLogIndex >= 0 {
-		lastLogTerm = rf.log[lastLogIndex].Term
-	}
+	lastLogIndex := rf.lastLogIndex()
+	lastLogTerm := rf.termAt(lastLogIndex)
 
 	for i := range rf.peers {
 		if i == rf.me {
@@ -58,7 +55,7 @@ func (rf *Raft) startElection() {
 				rf.lastHeard = time.Now()
 				rf.nextIndex = make([]int, len(rf.peers))
 				for i := range rf.nextIndex {
-					rf.nextIndex[i] = len(rf.log)
+					rf.nextIndex[i] = rf.lastLogIndex() + 1
 				}
 				rf.matchIndex = make([]int, len(rf.peers))
 				for i := range rf.matchIndex {

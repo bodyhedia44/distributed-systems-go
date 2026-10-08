@@ -24,17 +24,21 @@ func (rf *Raft) replicateOne(server int) {
 		rf.mu.Unlock()
 		return
 	}
+
+	if rf.nextIndex[server]-1 < rf.lastIncludedIndex {
+		rf.installSnapshotOn(server)
+		return
+	}
+
 	term := rf.currentTerm
 	prevLogIndex := rf.nextIndex[server] - 1
-	if prevLogIndex < 0 {
-		prevLogIndex = 0
+	if prevLogIndex > rf.lastLogIndex() {
+		prevLogIndex = rf.lastLogIndex()
 	}
-	if prevLogIndex >= len(rf.log) {
-		prevLogIndex = len(rf.log) - 1
-	}
-	prevLogTerm := rf.log[prevLogIndex].Term
-	entries := make([]LogEntry, len(rf.log[prevLogIndex+1:]))
-	copy(entries, rf.log[prevLogIndex+1:])
+	prevLogTerm := rf.termAt(prevLogIndex)
+	tail := rf.log[prevLogIndex-rf.lastIncludedIndex+1:]
+	entries := make([]LogEntry, len(tail))
+	copy(entries, tail)
 	leaderCommit := rf.commitIndex
 	rf.mu.Unlock()
 
@@ -77,8 +81,8 @@ func (rf *Raft) replicateOne(server int) {
 		rf.nextIndex[server] = reply.ConflictIndex
 	} else {
 		idx := -1
-		for i := len(rf.log) - 1; i >= 0; i-- {
-			if rf.log[i].Term == reply.ConflictTerm {
+		for i := rf.lastLogIndex(); i >= rf.lastIncludedIndex; i-- {
+			if rf.termAt(i) == reply.ConflictTerm {
 				idx = i
 				break
 			}
@@ -95,8 +99,8 @@ func (rf *Raft) replicateOne(server int) {
 }
 
 func (rf *Raft) updateCommitIndex() {
-	for n := len(rf.log) - 1; n > rf.commitIndex; n-- {
-		if rf.log[n].Term != rf.currentTerm {
+	for n := rf.lastLogIndex(); n > rf.commitIndex; n-- {
+		if rf.termAt(n) != rf.currentTerm {
 			continue
 		}
 		count := 1 // ourselves
@@ -113,14 +117,29 @@ func (rf *Raft) updateCommitIndex() {
 	}
 }
 
-// applier sends newly committed entries to applyCh in order.
+// applier sends newly committed entries, or an installed snapshot, to
+// applyCh in order. It's the only goroutine that writes to applyCh.
 func (rf *Raft) applier() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	for {
+		if rf.pendingSnapshotData != nil {
+			msg := raftapi.ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      rf.pendingSnapshotData,
+				SnapshotTerm:  rf.pendingSnapshotTerm,
+				SnapshotIndex: rf.pendingSnapshotIndex,
+			}
+			rf.pendingSnapshotData = nil
+			rf.mu.Unlock()
+			rf.applyCh <- msg
+			rf.mu.Lock()
+			continue
+		}
+
 		if rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
-			entry := rf.log[rf.lastApplied]
+			entry := rf.entryAt(rf.lastApplied)
 			index := rf.lastApplied
 			rf.mu.Unlock()
 			rf.applyCh <- raftapi.ApplyMsg{

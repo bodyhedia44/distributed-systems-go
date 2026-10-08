@@ -52,8 +52,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.persist()
 	}
 
-	lastLogIndex := len(rf.log) - 1
-	lastLogTerm := rf.log[lastLogIndex].Term
+	lastLogIndex := rf.lastLogIndex()
+	lastLogTerm := rf.termAt(lastLogIndex)
 	upToDate := args.LastLogTerm > lastLogTerm ||
 		(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
 
@@ -90,21 +90,30 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.lastHeard = time.Now()
 	reply.Term = rf.currentTerm
 
-	// reject if we're missing the entry at PrevLogIndex
-	if args.PrevLogIndex >= len(rf.log) {
+	// leader thinks we're missing entries we've already compacted into a
+	// snapshot; ask it to resume right after our snapshot
+	if args.PrevLogIndex < rf.lastIncludedIndex {
 		reply.Success = false
-		reply.ConflictIndex = len(rf.log)
+		reply.ConflictTerm = -1
+		reply.ConflictIndex = rf.lastIncludedIndex + 1
+		return
+	}
+
+	// reject if we're missing the entry at PrevLogIndex
+	if args.PrevLogIndex > rf.lastLogIndex() {
+		reply.Success = false
+		reply.ConflictIndex = rf.lastLogIndex() + 1
 		reply.ConflictTerm = -1
 		return
 	}
 
 	// reject if the term at PrevLogIndex doesn't match; tell the leader
 	// the first index of the conflicting term so it can skip back quickly
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if rf.termAt(args.PrevLogIndex) != args.PrevLogTerm {
 		reply.Success = false
-		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		reply.ConflictTerm = rf.termAt(args.PrevLogIndex)
 		idx := args.PrevLogIndex
-		for idx > 0 && rf.log[idx-1].Term == reply.ConflictTerm {
+		for idx > rf.lastIncludedIndex && rf.termAt(idx-1) == reply.ConflictTerm {
 			idx--
 		}
 		reply.ConflictIndex = idx
@@ -116,11 +125,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	i := 0
 	for ; i < len(args.Entries); i++ {
 		logIdx := insertAt + i
-		if logIdx >= len(rf.log) {
+		if logIdx > rf.lastLogIndex() {
 			break
 		}
-		if rf.log[logIdx].Term != args.Entries[i].Term {
-			rf.log = rf.log[:logIdx]
+		if rf.termAt(logIdx) != args.Entries[i].Term {
+			rf.log = rf.log[:logIdx-rf.lastIncludedIndex]
 			break
 		}
 	}

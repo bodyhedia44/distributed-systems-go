@@ -28,9 +28,20 @@ type Raft struct {
 
 	currentTerm int
 	votedFor    int
-	log         []LogEntry
+	log         []LogEntry // log[0] is a sentinel for lastIncludedIndex/lastIncludedTerm
 	commitIndex int
 	lastApplied int
+
+	// 3D: entries up to and including lastIncludedIndex have been compacted
+	// into a snapshot; log[0].Term == lastIncludedTerm.
+	lastIncludedIndex int
+	lastIncludedTerm  int
+
+	// a snapshot installed via InstallSnapshot, waiting for the applier
+	// goroutine to deliver it on applyCh (nil when there's nothing pending).
+	pendingSnapshotData  []byte
+	pendingSnapshotIndex int
+	pendingSnapshotTerm  int
 
 	// if leader
 	nextIndex  []int
@@ -44,6 +55,25 @@ type Raft struct {
 type LogEntry struct {
 	Term    int
 	Command interface{}
+}
+
+// the following helpers translate between global (1-based, pre-snapshot)
+// log indices and slice indices into rf.log. Caller must hold rf.mu.
+
+func (rf *Raft) lastLogIndex() int {
+	return rf.lastIncludedIndex + len(rf.log) - 1
+}
+
+func (rf *Raft) hasLogAt(index int) bool {
+	return index >= rf.lastIncludedIndex && index <= rf.lastLogIndex()
+}
+
+func (rf *Raft) termAt(index int) int {
+	return rf.log[index-rf.lastIncludedIndex].Term
+}
+
+func (rf *Raft) entryAt(index int) LogEntry {
+	return rf.log[index-rf.lastIncludedIndex]
 }
 
 // return currentTerm and whether this server
@@ -63,14 +93,20 @@ func (rf *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
-func (rf *Raft) persist() {
+func (rf *Raft) encodeState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
-	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
+	return w.Bytes()
+}
+
+func (rf *Raft) persist() {
+	// preserve whatever snapshot is already on disk; only the raft state changed
+	rf.persister.Save(rf.encodeState(), rf.persister.ReadSnapshot())
 }
 
 // restore previously persisted state.
@@ -83,14 +119,20 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var log []LogEntry
+	var lastIncludedIndex int
+	var lastIncludedTerm int
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&log) != nil {
+		d.Decode(&log) != nil ||
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil {
 		return
 	}
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
 	rf.log = log
+	rf.lastIncludedIndex = lastIncludedIndex
+	rf.lastIncludedTerm = lastIncludedTerm
 }
 
 // how many bytes in Raft's persisted log?
@@ -105,8 +147,18 @@ func (rf *Raft) PersistBytes() int {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if index <= rf.lastIncludedIndex || index > rf.lastLogIndex() {
+		return // already compacted past this point, or we don't have this entry
+	}
+
+	rf.lastIncludedTerm = rf.termAt(index)
+	rf.log = append([]LogEntry{}, rf.log[index-rf.lastIncludedIndex:]...)
+	rf.lastIncludedIndex = index
+
+	rf.persister.Save(rf.encodeState(), snapshot)
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -128,7 +180,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, rf.currentTerm, false
 	}
 
-	index := len(rf.log)
+	index := rf.lastLogIndex() + 1
 	rf.log = append(rf.log, LogEntry{Command: command, Term: rf.currentTerm})
 	rf.persist()
 
@@ -177,6 +229,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.commitIndex = rf.lastIncludedIndex
+	rf.lastApplied = rf.lastIncludedIndex
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
