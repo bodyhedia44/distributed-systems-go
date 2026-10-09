@@ -90,8 +90,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.lastHeard = time.Now()
 	reply.Term = rf.currentTerm
 
-	// leader thinks we're missing entries we've already compacted into a
-	// snapshot; ask it to resume right after our snapshot
 	if args.PrevLogIndex < rf.lastIncludedIndex {
 		reply.Success = false
 		reply.ConflictTerm = -1
@@ -99,7 +97,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// reject if we're missing the entry at PrevLogIndex
 	if args.PrevLogIndex > rf.lastLogIndex() {
 		reply.Success = false
 		reply.ConflictIndex = rf.lastLogIndex() + 1
@@ -107,8 +104,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// reject if the term at PrevLogIndex doesn't match; tell the leader
-	// the first index of the conflicting term so it can skip back quickly
 	if rf.termAt(args.PrevLogIndex) != args.PrevLogTerm {
 		reply.Success = false
 		reply.ConflictTerm = rf.termAt(args.PrevLogIndex)
@@ -120,7 +115,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// find first point of disagreement with the new entries, then truncate and append
 	insertAt := args.PrevLogIndex + 1
 	i := 0
 	for ; i < len(args.Entries); i++ {

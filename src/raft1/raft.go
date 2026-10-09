@@ -49,7 +49,7 @@ type Raft struct {
 	lastHeard  time.Time
 
 	applyCh   chan raftapi.ApplyMsg
-	applyCond *sync.Cond // signaled when commitIndex advances, for the applier goroutine
+	applyCond *sync.Cond // signaled when commitIndex advances for the applier goroutine
 }
 
 type LogEntry struct {
@@ -105,7 +105,6 @@ func (rf *Raft) encodeState() []byte {
 }
 
 func (rf *Raft) persist() {
-	// preserve whatever snapshot is already on disk; only the raft state changed
 	rf.persister.Save(rf.encodeState(), rf.persister.ReadSnapshot())
 }
 
@@ -151,7 +150,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.mu.Unlock()
 
 	if index <= rf.lastIncludedIndex || index > rf.lastLogIndex() {
-		return // already compacted past this point, or we don't have this entry
+		return
 	}
 
 	rf.lastIncludedTerm = rf.termAt(index)
