@@ -9,19 +9,21 @@ package shardkv
 //
 
 import (
+	"time"
+
 	"6.5840/shardkv1/shardgrp"
 
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
+	kvtest "6.5840/kvtest1"
+	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardctrler"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Clerk struct {
 	clnt *tester.Clnt
 	sck  *shardctrler.ShardCtrler
-	rcks   map[tester.Tgid]*shardgrp.Clerk
-	// You will have to modify this struct.
+	rcks map[tester.Tgid]*shardgrp.Clerk
 }
 
 // The tester calls MakeClerk and passes in a shardctrler so that
@@ -41,6 +43,16 @@ func (ck *Clerk) GetClerk(gid tester.Tgid) (*shardgrp.Clerk, bool) {
 	return rck, ok
 }
 
+// clerkFor returns the (cached) shardgrp clerk for gid, creating one if needed.
+// A group's member servers never change, so caching by gid is safe.
+func (ck *Clerk) clerkFor(gid tester.Tgid, servers []string) *shardgrp.Clerk {
+	rck, ok := ck.GetClerk(gid)
+	if !ok {
+		rck = shardgrp.MakeClerk(ck.clnt, servers)
+		ck.rcks[gid] = rck
+	}
+	return rck
+}
 
 // Get a key from a shardgrp.  You can use shardcfg.Key2Shard(key) to
 // find the shard responsible for the key and ck.sck.Query() to read
@@ -48,12 +60,55 @@ func (ck *Clerk) GetClerk(gid tester.Tgid) (*shardgrp.Clerk, bool) {
 // responsible for key.  You can make a clerk for that group by
 // calling shardgrp.MakeClerk(ck.clnt, servers).
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
-	// You will have to modify this function.
-	return "", 0, ""
+	shard := shardcfg.Key2Shard(key)
+	for {
+		cfg := ck.sck.Query()
+		gid, servers, ok := cfg.GidServers(shard)
+		if !ok {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		rck := ck.clerkFor(gid, servers)
+		val, ver, err := rck.Get(key)
+		if err == rpc.ErrWrongGroup {
+			continue
+		}
+		if err == rpc.ErrWrongLeader {
+			// shardgrp may be mid-election, unreachable, or gone (shard
+			// moved elsewhere); re-check the config and retry.
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		return val, ver, err
+	}
 }
 
 // Put a key to a shard group.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
-	// You will have to modify this function.
-	return ""
+	shard := shardcfg.Key2Shard(key)
+	ambiguous := false
+	for {
+		cfg := ck.sck.Query()
+		gid, servers, ok := cfg.GidServers(shard)
+		if !ok {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		rck := ck.clerkFor(gid, servers)
+		err := rck.Put(key, value, version)
+		if err == rpc.ErrWrongGroup {
+			continue
+		}
+		if err == rpc.ErrWrongLeader {
+			// ambiguous: the shardgrp clerk may have reached the leader
+			// without the reply making it back; remember that across retries.
+			ambiguous = true
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if ambiguous && err == rpc.ErrVersion {
+			return rpc.ErrMaybe
+		}
+		return err
+	}
 }
